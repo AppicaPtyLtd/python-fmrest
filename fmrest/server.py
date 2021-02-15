@@ -1,17 +1,21 @@
 """Server class for API connections"""
 import json
-import importlib.util
-import warnings
+import time
+from datetime import datetime, timedelta
+
 from typing import List, Dict, Optional, Any, IO, Tuple, Union, Iterator
 from functools import wraps
 import requests
-from .utils import request, build_portal_params, build_script_params, filename_from_url
-from .const import API_PATH, PORTAL_PREFIX, FMSErrorCode
-from .exceptions import BadJSON, FileMakerError, RecordError
+
+from .server_abc import ServerABC
+from .utils import request
+from .const import PORTAL_PREFIX, FMSErrorCode
+from .exceptions import BadJSON, FileMakerError, RecordError, FILEMAKER_NOT_FOUND_ERRORS
 from .record import Record
 from .foundset import Foundset
 
-class Server(object):
+
+class Server(ServerABC):
     """The server class provides easy access to the FileMaker Data API
 
     Get an instance of this class, login, get a record, logout:
@@ -33,13 +37,18 @@ class Server(object):
             my_server.login()
             # do stuff
     """
+    _headers: Dict[str, str]
 
     def __init__(self, url: str, user: str,
-                 password: str, database: str, layout: str,
+                 password: str, database: str,
+                 retry_get_record_on_not_found: bool = False,
+                 retry_get_record_on_not_found_attempts: int = 1,
+                 retry_get_record_on_not_found_delay: timedelta = timedelta(milliseconds=500),
                  data_sources: Optional[List[Dict]] = None,
                  verify_ssl: Union[bool, str] = True,
                  type_conversion: bool = False,
-                 auto_relogin: bool = False) -> None:
+                 auto_relogin: bool = False,
+                 auto_relogin_timeout: timedelta = timedelta(minutes=14)) -> None:
         """Initialize the Server class.
 
         Parameters
@@ -79,40 +88,19 @@ class Server(object):
             request comes back with a 952 (invalid token) error. Defaults to
             False.
         """
-
-        self.url = url
-        self.user = user
-        self.password = password
-        self.database = database
-        self.layout = layout
-        self.data_sources = [] if data_sources is None else data_sources
-        self.verify_ssl = verify_ssl
+        super().__init__(url, user, password, database,
+                         retry_get_record_on_not_found,
+                         retry_get_record_on_not_found_attempts,
+                         retry_get_record_on_not_found_delay,
+                         data_sources, verify_ssl,
+                         type_conversion)
         self.auto_relogin = auto_relogin
-
-        self.type_conversion = type_conversion
-        if type_conversion and not importlib.util.find_spec("dateutil"):
-            warnings.warn('Turning on type_conversion needs the dateutil module, which '
-                          'does not seem to be present on your system.')
-
-        if url[:5] != 'https':
-            raise ValueError('Please make sure to use https, otherwise calls to the Data '
-                             'API will not work.')
-
-        self._token: Optional[str] = None
-        self._last_fm_error: Optional[int] = None
-        self._last_script_result: Optional[Dict[str, List]] = None
-        self._headers: Dict[str, str] = {}
-        self._set_content_type()
-
-    def __enter__(self) -> 'Server':
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_traceback) -> None:
-        self.logout()
+        self.auto_relogin_timeout = auto_relogin_timeout
+        self.token_expired_at: Optional[datetime] = None
 
     def __repr__(self) -> str:
-        return '<Server logged_in={} database={} layout={}>'.format(
-            bool(self._token), self.database, self.layout
+        return '<Server logged_in={} database={}>'.format(
+            bool(self._token), self.database
         )
 
     def _with_auto_relogin(f):
@@ -122,6 +110,9 @@ class Server(object):
                 return f(self, *args, **kwargs)
 
             try:
+                if self.token_expired_at is None or datetime.now() > self.token_expired_at:
+                    self._token = None
+                    self.login()
                 return f(self, *args, **kwargs)
             except FileMakerError:
                 if self.last_error == FMSErrorCode.INVALID_DAPI_TOKEN.value:
@@ -133,6 +124,35 @@ class Server(object):
                 raise  # if another error occurred, re-raise the exception
         return wrapper
 
+    def _with_retry_get_resource(f):
+        @wraps(f)
+        def wrapper(self, *args, **kwargs):
+            if not self.retry_get_record_on_not_found:
+                return f(self, *args, **kwargs)
+
+            attempted = 0
+            error = None
+
+            while attempted <= self.retry_get_record_on_not_found_attempts:
+                try:
+                    result = f(self, *args, **kwargs)
+                    return result
+                except FileMakerError as e:
+                    error = e
+
+                    if str(e) not in FILEMAKER_NOT_FOUND_ERRORS:
+                        raise  # if another error occurred, re-raise the exception
+
+                    time.sleep(self.retry_get_record_on_not_found_delay.total_seconds())
+                finally:
+                    attempted += 1
+
+                # Attempted N times. Return the latest error
+            if error is not None:
+                raise error
+
+        return wrapper
+
     def login(self) -> Optional[str]:
         """Logs into FMServer and returns access token.
 
@@ -141,30 +161,19 @@ class Server(object):
 
         Note that OAuth is currently not supported.
         """
-
-        path = API_PATH['auth'].format(database=self.database, token='')
-        data = {'fmDataSource': self.data_sources}
-
-        response = self._call_filemaker('POST', path, data, auth=(self.user, self.password))
-        self._token = response.get('token', None)
-
-        return self._token
+        payload = self.login_prepare_payload()
+        response = self._call_filemaker(**payload)
+        self.token_expired_at = datetime.now() + self.auto_relogin_timeout
+        return self.login_prepare_result(response)
 
     def logout(self) -> bool:
-        """Logs out of current session. Returns True if successful.
-
-        Note: this method is also called by __exit__
         """
-
-	# token is expected in endpoint for logout
-        path = API_PATH['auth'].format(database=self.database, token=self._token)
-
-	# remove token, so that the Authorization header is not sent for logout
-	# (_call_filemaker() will update the headers)
-        self._token = ''
-        self._call_filemaker('DELETE', path)
-
-        return self.last_error == FMSErrorCode.SUCCESS.value
+         Logs out of current session. Returns True if successful.
+         Note: this method is also called by __exit__
+         """
+        payload = self.logout_prepare_payload()
+        self._call_filemaker(**payload)
+        return self.logout_prepare_result()
 
     def create(self, record: Record) -> Optional[int]:
         """Shortcut to create_record method. Takes record instance and calls create_record."""
@@ -172,13 +181,15 @@ class Server(object):
         return self.create_record(record.to_dict(ignore_portals=True, ignore_internal_ids=True))
 
     @_with_auto_relogin
-    def create_record(self, field_data: Dict[str, Any],
+    def create_record(self,
+                      layout: str,
+                      field_data: Dict[str, Any],
                       portals: Optional[Dict[str, Any]] = None,
                       scripts: Optional[Dict[str, List]] = None) -> Optional[int]:
         """Creates a new record with given field data and returns new internal record id.
-
         Parameters
         -----------
+        layout: str
         field_data : dict
             Dict of field names as defined in FileMaker: E.g.: {'name': 'David', 'drink': 'Coffee'}
         scripts : dict, optional
@@ -193,36 +204,27 @@ class Server(object):
                 {'TO::field': 'another record'}
             ]
         """
-        path = API_PATH['record'].format(
-            database=self.database,
-            layout=self.layout,
-        )
+        payload = self.create_record_prepare_payload(layout,
+                                                     field_data,
+                                                     portals,
+                                                     scripts)
+        response = self._call_filemaker(**payload)
+        return self.create_record_prepare_result(response)
 
-        request_data: Dict = {'fieldData': field_data}
-        if portals:
-            request_data['portalData'] = portals
-
-        # build script param object in FMSDAPI style
-        script_params = build_script_params(scripts) if scripts else None
-        if script_params:
-            request_data.update(script_params)
-
-        response = self._call_filemaker('POST', path, request_data)
-        record_id = response.get('recordId')
-
-        return int(record_id) if record_id else None
-
-    def edit(self, record: Record, validate_mod_id: bool = False) -> bool:
+    def edit(self, layout: str, record: Record, validate_mod_id: bool = False) -> bool:
         """Shortcut to edit_record method. Takes (modified) record instance and calls edit_record"""
         mod_id = record.modification_id if validate_mod_id else None
-        return self.edit_record(record.record_id, record.modifications(), mod_id)
+        return self.edit_record(layout, record.record_id, record.modifications(), mod_id)
 
     @_with_auto_relogin
-    def edit_record(self, record_id: int, field_data: Dict[str, Any],
-                    mod_id: Optional[int] = None, portals: Optional[Dict[str, Any]] = None,
+    def edit_record(self,
+                    layout: str,
+                    record_id: int,
+                    field_data: Dict[str, Any],
+                    mod_id: Optional[int] = None,
+                    portals: Optional[Dict[str, Any]] = None,
                     scripts: Optional[Dict[str, List]] = None) -> bool:
         """Edits the record with the given record_id and field_data. Return True on success.
-
         Parameters
         -----------
         record_id : int
@@ -248,27 +250,14 @@ class Server(object):
             Allowed types: 'prerequest', 'presort', 'after'
             List should have length of 2 (both script name and parameter are required.)
         """
-        path = API_PATH['record_action'].format(
-            database=self.database,
-            layout=self.layout,
-            record_id=record_id
-        )
-
-        request_data: Dict = {'fieldData': field_data}
-        if mod_id:
-            request_data['modId'] = mod_id
-
-        if portals:
-            request_data['portalData'] = portals
-
-        # build script param object in FMSDAPI style
-        script_params = build_script_params(scripts) if scripts else None
-        if script_params:
-            request_data.update(script_params)
-
-        self._call_filemaker('PATCH', path, request_data)
-
-        return self.last_error == FMSErrorCode.SUCCESS.value
+        payload = self.edit_record_prepare_payload(layout,
+                                                   record_id,
+                                                   field_data,
+                                                   mod_id,
+                                                   portals,
+                                                   scripts)
+        self._call_filemaker(**payload)
+        return self.edit_record_prepare_result()
 
     def delete(self, record: Record) -> bool:
         """Shortcut to delete_record method. Takes record instance and calls delete_record."""
@@ -280,9 +269,8 @@ class Server(object):
         return self.delete_record(record_id)
 
     @_with_auto_relogin
-    def delete_record(self, record_id: int, scripts: Optional[Dict[str, List]] = None):
+    def delete_record(self, layout: str, record_id: int, scripts: Optional[Dict[str, List]] = None):
         """Deletes a record for the given record_id. Returns True on success.
-
         Parameters
         -----------
         record_id : int
@@ -293,22 +281,17 @@ class Server(object):
             Allowed types: 'prerequest', 'presort', 'after'
             List should have length of 2 (both script name and parameter are required.)
         """
-        path = API_PATH['record_action'].format(
-            database=self.database,
-            layout=self.layout,
-            record_id=record_id
-        )
+        payload = self.delete_record_prepare_payload(layout, record_id, scripts)
+        self._call_filemaker(**payload)
+        return self.delete_record_prepare_response()
 
-        params = build_script_params(scripts) if scripts else None
-
-        self._call_filemaker('DELETE', path, params=params)
-
-        return self.last_error == FMSErrorCode.SUCCESS.value
-
+    @_with_retry_get_resource
     @_with_auto_relogin
-    def get_record(self, record_id: int, portals: Optional[List[Dict]] = None,
-                   scripts: Optional[Dict[str, List]] = None,
-                   layout: Optional[str] = None) -> Record:
+    def get_record(self,
+                   layout: str,
+                   record_id: int,
+                   portals: Optional[List[Dict]] = None,
+                   scripts: Optional[Dict[str, List]] = None) -> Record:
         """Fetches record with given ID and returns Record instance
 
         Parameters
@@ -331,28 +314,17 @@ class Server(object):
             This is helpful, for example, if you want to limit the number of fields/portals being
             returned and have a dedicated response layout.
         """
-        path = API_PATH['record_action'].format(
-            database=self.database,
-            layout=self.layout,
-            record_id=record_id
-        )
-
-        params = build_portal_params(portals, True) if portals else {}
-        params['layout.response'] = layout
-
-        # build script param object in FMSDAPI style
-        script_params = build_script_params(scripts) if scripts else None
-        if script_params:
-            params.update(script_params)
-
-        response = self._call_filemaker('GET', path, params=params)
-
-        # pass response to foundset generator function. As we are only requesting one record though,
-        # we only re-use the code and immediately consume the first (and only) record via next().
-        return next(self._process_foundset_response(response))
+        payload = self.get_record_prepare_payload(layout,
+                                                  record_id,
+                                                  portals,
+                                                  scripts)
+        response = self._call_filemaker(**payload)
+        return self.get_record_prepare_result(response)
 
     @_with_auto_relogin
-    def perform_script(self, name: str,
+    def perform_script(self,
+                       layout: str,
+                       name: str,
                        param: Optional[str] = None) -> Tuple[Optional[int], Optional[str]]:
         """Performs a script with the given name and parameter.
 
@@ -365,22 +337,12 @@ class Server(object):
         param: str
             Optional script parameter
         """
-        path = API_PATH['script'].format(
-            database=self.database,
-            layout=self.layout,
-            script_name=name
-        )
-
-        response = self._call_filemaker('GET', path, params={'script.param': param})
-
-        script_error = response.get('scriptError', None)
-        script_error = int(script_error) if script_error else None
-        script_result = response.get('scriptResult', None)
-
-        return script_error, script_result
+        payload = self.perform_script_prepare_payload(layout, name, param)
+        response = self._call_filemaker(**payload)
+        return self.perform_script_prepare_result(response)
 
     @_with_auto_relogin
-    def upload_container(self, record_id: int, field_name: str, file_: IO) -> bool:
+    def upload_container(self, layout: str, record_id: int, field_name: str, file_: IO) -> bool:
         """Uploads the given binary data for the given record id and returns True on success.
         Parameters
         -----------
@@ -391,24 +353,19 @@ class Server(object):
         file_ : fileobj
             File object as returned by open() in binary mode.
         """
-        path = API_PATH['record_action'].format(
-            database=self.database,
-            layout=self.layout,
-            record_id=record_id
-        ) + '/containers/' + field_name + '/1'
+        payload = self.upload_container_prepare_payload(layout, record_id, field_name, file_)
+        self._call_filemaker(**payload)
+        return self.upload_container_prepare_result()
 
-        # requests library handles content type for multipart/form-data incl. boundary
-        self._set_content_type(False)
-        self._call_filemaker('POST', path, files={'upload': file_})
-
-        return self.last_error == FMSErrorCode.SUCCESS.value
-
+    @_with_retry_get_resource
     @_with_auto_relogin
-    def get_records(self, offset: int = 1, limit: int = 100,
+    def get_records(self,
+                    layout: str,
+                    offset: int = 1,
+                    limit: int = 100,
                     sort: Optional[List[Dict[str, str]]] = None,
                     portals: Optional[List[Dict[str, Any]]] = None,
-                    scripts: Optional[Dict[str, List]] = None,
-                    layout: Optional[str] = None) -> Foundset:
+                    scripts: Optional[Dict[str, List]] = None) -> Foundset:
         """Requests all records with given offset and limit and returns result as
         (sorted) Foundset instance.
 
@@ -435,36 +392,25 @@ class Server(object):
             This is helpful, for example, if you want to limit the number of fields/portals being
             returned and have a dedicated response layout.
         """
-        path = API_PATH['record'].format(
-            database=self.database,
-            layout=self.layout
-        )
+        payload = self.get_records_prepare_payload(layout,
+                                                   offset,
+                                                   limit,
+                                                   sort,
+                                                   portals,
+                                                   scripts)
+        response = self._call_filemaker(**payload)
+        return self.get_records_prepare_result(response, layout)
 
-        params = build_portal_params(portals, True) if portals else {}
-        params['_offset'] = offset
-        params['_limit'] = limit
-        params['layout.response'] = layout
-
-        if sort:
-            params['_sort'] = json.dumps(sort)
-
-        # build script param object in FMSDAPI style
-        script_params = build_script_params(scripts) if scripts else None
-        if script_params:
-            params.update(script_params)
-
-        response = self._call_filemaker('GET', path, params=params)
-        info = response.get('dataInfo', {})
-
-        return Foundset(self._process_foundset_response(response), info)
-
+    @_with_retry_get_resource
     @_with_auto_relogin
-    def find(self, query: List[Dict[str, Any]],
+    def find(self,
+             layout: str,
+             query: List[Dict[str, Any]],
              sort: Optional[List[Dict[str, str]]] = None,
-             offset: int = 1, limit: int = 100,
+             offset: int = 1,
+             limit: int = 100,
              portals: Optional[List[Dict[str, Any]]] = None,
-             scripts: Optional[Dict[str, List]] = None,
-             layout: Optional[str] = None) -> Foundset:
+             scripts: Optional[Dict[str, List]] = None) -> Foundset:
         """Finds all records matching query and returns result as a Foundset instance.
 
         Parameters
@@ -501,38 +447,19 @@ class Server(object):
             This is helpful, for example, if you want to limit the number of fields/portals being
             returned and have a dedicated response layout.
         """
-        path = API_PATH['find'].format(
-            database=self.database,
-            layout=self.layout
-        )
+        payload = self.find_prepare_payload(layout,
+                                            query,
+                                            sort,
+                                            offset,
+                                            limit,
+                                            portals,
+                                            scripts)
+        response = self._call_filemaker(**payload)
+        return self.find_prepare_result(layout, response)
 
-        data = {
-            'query': query,
-            'sort': sort,
-            'limit': str(limit),
-            'offset': str(offset),
-            'layout.response': layout
-        }
-
-        # build script param object in FMSDAPI style
-        script_params = build_script_params(scripts) if scripts else None
-        if script_params:
-            data.update(script_params)
-
-        # build portal param object in FMSDAPI style
-        portal_params = build_portal_params(portals) if portals else None
-        if portal_params:
-            data.update(portal_params)
-
-        # FM Data API from v17 cannot handle null values, so we remove all Nones from data
-        data = {k:v for k, v in data.items() if v is not None}
-
-        response = self._call_filemaker('POST', path, data=data)
-        info = response.get('dataInfo', {})
-
-        return Foundset(self._process_foundset_response(response), info)
-
-    def fetch_file(self, file_url: str,
+    def fetch_file(self,
+                   layout: str,
+                   file_url: str,
                    stream: bool = False) -> Tuple[str, Optional[str], Optional[str], requests.Response]:
         """Fetches the file from the given url.
 
@@ -556,17 +483,9 @@ class Server(object):
             If you are not consuming all data, make sure to close the connection after use by
             calling response.close().
         """
-        name = filename_from_url(file_url)
-        response = request(method='get',
-                           url=file_url,
-                           verify=self.verify_ssl,
-                           stream=stream
-                          )
-
-        return (name,
-                response.headers.get('Content-Type'),
-                response.headers.get('Content-Length'),
-                response)
+        payload = self.fetch_file_prepare_payload(layout, file_url, stream)
+        response = self._call_filemaker(**payload)
+        return self.find_prepare_result(layout, response)
 
     @_with_auto_relogin
     def set_globals(self, globals_: Dict[str, Any]) -> bool:
@@ -583,12 +502,9 @@ class Server(object):
             Example:
                 { 'Table::myField': 'whatever' }
         """
-        path = API_PATH['global'].format(database=self.database)
-
-        data = {'globalFields': globals_}
-
-        self._call_filemaker('PATCH', path, data=data)
-        return self.last_error == FMSErrorCode.SUCCESS.value
+        payload = self.set_globals_prepare_payload(globals_)
+        self._call_filemaker(**payload)
+        return self.set_globals_prepare_result()
 
     @property
     def last_error(self) -> Optional[int]:
@@ -648,7 +564,7 @@ class Server(object):
         request_data = json.dumps(data) if data else None
 
         # if we have a token, make sure it's included in the header
-	# if not, the Authorization header gets removed (necessary for example for logout)
+	    # if not, the Authorization header gets removed (necessary for example for logout)
         self._update_token_header()
 
         response = request(method=method,
@@ -657,26 +573,14 @@ class Server(object):
                            data=request_data,
                            verify=self.verify_ssl,
                            params=params,
-                           **kwargs
-                          )
+                           **kwargs)
 
         try:
             response_data = response.json()
         except json.decoder.JSONDecodeError as ex:
             raise BadJSON(ex, response) from None
 
-        fms_messages = response_data.get('messages')
-        fms_response = response_data.get('response')
-
-        self._update_script_result(fms_response)
-        self._last_fm_error = fms_messages[0].get('code', -1)
-        if self.last_error != FMSErrorCode.SUCCESS.value:
-            raise FileMakerError(self._last_fm_error,
-                                 fms_messages[0].get('message', 'Unkown error'))
-
-        self._set_content_type() # reset content type
-
-        return fms_response
+        return self.handle_response_data(response_data)
 
     def _update_script_result(self, response: Dict) -> Dict[str, List]:
         """Extracts script result data from fms response and updates script result attribute"""
@@ -773,3 +677,9 @@ class Server(object):
                 values.append(Foundset(related_records, portal_info.get(portal_name, {})))
 
             yield Record(keys, values, type_conversion=self.type_conversion)
+
+    def __enter__(self) -> 'Server':
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_traceback) -> None:
+        self.logout()

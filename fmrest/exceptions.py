@@ -1,8 +1,16 @@
 from typing import Optional, Any
-import requests
+
+
+FILEMAKER_NOT_FOUND_ERRORS = [
+    'FileMaker Server returned error 101, Record is missing',
+    'FileMaker Server returned error 401, No records match the request',
+    'FileMaker Server returned error 400, Find criteria are empty',
+]
+
 
 class FMRestException(Exception):
     """The base fmrest Exception."""
+
 
 class RequestException(FMRestException):
     """Exception for http request errors
@@ -32,7 +40,7 @@ class ResponseException(FMRestException):
     Re-raised after requests module exception
     """
 
-    def __init__(self, original_exception: Exception, response: requests.Response) -> None:
+    def __init__(self, original_exception: Exception, response: Any) -> None:
         """Parameters
         ----------
         original_exception
@@ -48,14 +56,17 @@ class ResponseException(FMRestException):
                 self._response.headers.get('content-type', None))
         )
 
+
 class BadJSON(ResponseException):
     """Invalid json response"""
+
 
 class FileMakerError(FMRestException):
     """Error raised by FileMaker Data API"""
 
     def __init__(self, error_code: Optional[int], error_message: str) -> None:
         super().__init__('FileMaker Server returned error {}, {}'.format(error_code, error_message))
+
 
 class RecordError(FMRestException):
     """Error with the local Record instance."""
